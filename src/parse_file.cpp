@@ -17,6 +17,7 @@
 // system
 #include <fcntl.h> // open
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h> // close
 
 // application
@@ -90,20 +91,6 @@ file_details detect_file(freader& s) {
 
         return result;
     });
-}
-
-/**************************************************************************************************/
-
-auto mmap_file(const std::filesystem::path& p) {
-    // using result_type = std::unique_ptr<char, std::function<void(char*)>>;
-    using result_type = std::shared_ptr<char>;
-    auto size = std::filesystem::file_size(p);
-    int fd = open(p.string().c_str(), O_RDONLY);
-    void* ptr = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
-    close(fd);
-    if (ptr == MAP_FAILED) return result_type();
-    auto deleter = [_sz = size](void* x) { munmap(x, _sz); };
-    return result_type(static_cast<char*>(ptr), std::move(deleter));
 }
 
 /**************************************************************************************************/
@@ -182,7 +169,85 @@ void parse_file(std::string_view object_name,
 
 /**************************************************************************************************/
 
+namespace {
+
+/**************************************************************************************************/
+
+auto make_shared_fd(const std::filesystem::path& p) {
+    auto deleter = [](int* x) { close(*x); };
+    auto fd = open(p.string().c_str(), O_RDONLY);
+    return std::shared_ptr<int>(new int(fd), std::move(deleter));
+}
+
+auto filesize(int fd) {
+    struct stat s;
+    if (fstat(fd, &s) == -1) throw std::runtime_error("bad fstat"); // better error here?
+    return s.st_size;
+}
+
+/**************************************************************************************************/
+
+} // namespace
+
+/**************************************************************************************************/
+
+file_descriptor::file_descriptor(const std::filesystem::path& p) : _fd{make_shared_fd(p)} {}
+
+/**************************************************************************************************/
+
+mmap_buffer::mmap_buffer(int fd, std::size_t start, std::size_t end) {
+    auto size = end - start;
+    void* ptr = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, start);
+    if (ptr == MAP_FAILED) throw std::runtime_error("bad mmap"); // better error here?
+    auto deleter = [_sz = size](void* x) { munmap(x, _sz); };
+    _buffer = std::shared_ptr<char>(static_cast<char*>(ptr), std::move(deleter));
+}
+
+/**************************************************************************************************/
+
+mmap_buffer::mmap_buffer(int fd) : mmap_buffer(fd, 0, filesize(fd)) {}
+
+/**************************************************************************************************/
+
+filebuf::filebuf(const std::filesystem::path& p) : _descriptor{p}, _buffer{*_descriptor} {}
+
+/**************************************************************************************************/
+
+auto filebuf::remmap(std::size_t start, std::size_t end) {
+    const auto page_size = sysconf(_SC_PAGESIZE);
+    const auto start_page = start / page_size;
+    const auto start_page_offset = start_page * page_size;
+    const auto end_page = end / page_size + 1;
+    const auto end_page_offset = end_page * page_size;
+
+    assert(start < end);
+    assert(start_page_offset <= start);
+    assert(end_page_offset >= end);
+
+    filebuf result;
+    result._descriptor = _descriptor;
+    result._buffer = mmap_buffer(*_descriptor, start_page_offset, end_page_offset);
+    return result;
+}
+
+/**************************************************************************************************/
+
 freader::freader(const std::filesystem::path& p)
-    : _buffer(mmap_file(p)), _f(_buffer.get()), _p(_f), _l(_p + std::filesystem::file_size(p)) {}
+    : _filebuf(p), _f(_filebuf.get()), _p(_f), _l(_p + std::filesystem::file_size(p)) {}
+
+/**************************************************************************************************/
+
+freader freader::subbuf(std::size_t end_pos) const {
+    freader result(*this);
+    auto pos = _p - _f;
+    auto new_size = end_pos - pos;
+    //auto size = _l - _f;
+    result._filebuf = result._filebuf.remmap(pos, end_pos);
+    // recalculate the new _p given the page offset of the buffer
+    result._f = result._filebuf.get();
+    result._p = _f - pos;
+    result._l = _f + new_size;
+    return result;
+}
 
 /**************************************************************************************************/

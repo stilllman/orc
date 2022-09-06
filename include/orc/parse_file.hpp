@@ -19,6 +19,45 @@
 #include "orc/string_pool.hpp"
 
 /**************************************************************************************************/
+// read-only file descriptor
+struct file_descriptor {
+    file_descriptor() = default;
+    explicit file_descriptor(const std::filesystem::path& p);
+    explicit operator bool() const { return static_cast<bool>(_fd); }
+    auto operator*() const { return *_fd; }
+
+private:
+    std::shared_ptr<int> _fd;
+};
+
+/**************************************************************************************************/
+
+struct mmap_buffer {
+    mmap_buffer() = default;
+    explicit mmap_buffer(int fd);
+    explicit mmap_buffer(int fd, std::size_t start, std::size_t end);
+    explicit operator bool() const { return static_cast<bool>(_buffer); }
+    const char* get() const { return _buffer.get(); }
+
+private:
+    std::shared_ptr<char> _buffer;
+};
+
+/**************************************************************************************************/
+
+struct filebuf {
+    explicit filebuf() = default;
+    explicit filebuf(const std::filesystem::path& p);
+    explicit operator bool() const { return _descriptor && _buffer; }
+    const char* get() const { return _buffer.get(); }
+    auto remmap(std::size_t start, std::size_t end);
+
+private:
+    file_descriptor _descriptor;
+    mmap_buffer _buffer;
+};
+
+/**************************************************************************************************/
 // very minimal file reader. Uses mmap to bring the file into memory, and subsequently unmaps it
 // when the reader destructs. Doesn't do any kinds of bounds checking while reading (that's a
 // responsibility of the user at this point, but we could change it if it's more valuable to do so
@@ -29,7 +68,7 @@ struct freader {
     explicit freader(const std::filesystem::path& p);
 
     // `<=` here because sometimes we jump to one past the end of the buffer right before stopping.
-    explicit operator bool() const { return static_cast<bool>(_buffer) && _p <= _l; }
+    explicit operator bool() const { return static_cast<bool>(_filebuf) && _p <= _l; }
 
     std::size_t size() const { return _l - _p; }
 
@@ -81,11 +120,16 @@ struct freader {
         return std::string_view(f, n);
     }
 
+    // creates a new _buffer using the same mmapped pages, but limited to the range
+    // [tellg(), end_pos), allowing for the parent freader to fall out of scope and
+    // free up unused memory.
+    freader subbuf(std::size_t end_pos) const;
+
 private:
-    std::shared_ptr<char> _buffer;
-    char* _f{0};
-    char* _p{0};
-    char* _l{0};
+    filebuf _filebuf;
+    const char* _f{0};
+    const char* _p{0};
+    const char* _l{0};
 };
 
 /**************************************************************************************************/

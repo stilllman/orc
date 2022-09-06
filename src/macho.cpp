@@ -23,6 +23,16 @@ namespace {
 
 /**************************************************************************************************/
 
+struct section {
+    std::string _name;
+    std::size_t _offset;
+    std::size_t _size;
+};
+
+using sections = std::vector<section>;
+
+/**************************************************************************************************/
+
 struct section_64 {
     char sectname[16]{0};
     char segname[16]{0};
@@ -40,7 +50,7 @@ struct section_64 {
 
 /**************************************************************************************************/
 
-void read_lc_segment_64_section(freader& s, const file_details& details, dwarf& dwarf) {
+void read_lc_segment_64_section(freader& s, const file_details& details, sections& sections) {
     auto section = read_pod<section_64>(s);
     if (details._needs_byteswap) {
         // endian_swap(section.sectname[16]);
@@ -59,8 +69,13 @@ void read_lc_segment_64_section(freader& s, const file_details& details, dwarf& 
 
     if (rstrip(section.segname) != "__DWARF") return;
 
-    dwarf.register_section(rstrip(section.sectname), details._offset + section.offset,
-                           section.size);
+    struct section result {
+        rstrip(section.sectname),
+        details._offset + section.offset,
+        section.size
+    };
+
+    sections.emplace_back(std::move(result));
 }
 
 /**************************************************************************************************/
@@ -83,7 +98,7 @@ struct segment_command_64 {
 
 /**************************************************************************************************/
 
-void read_lc_segment_64(freader& s, const file_details& details, dwarf& dwarf) {
+void read_lc_segment_64(freader& s, const file_details& details, sections& sections) {
     auto lc = read_pod<segment_command_64>(s);
     if (details._needs_byteswap) {
         endian_swap(lc.cmd);
@@ -100,7 +115,7 @@ void read_lc_segment_64(freader& s, const file_details& details, dwarf& dwarf) {
     }
 
     for (std::size_t i = 0; i < lc.nsects; ++i) {
-        read_lc_segment_64_section(s, details, dwarf);
+        read_lc_segment_64_section(s, details, sections);
     }
 }
 
@@ -113,7 +128,7 @@ struct load_command {
 
 /**************************************************************************************************/
 
-void read_load_command(freader& s, const file_details& details, dwarf& dwarf) {
+void read_load_command(freader& s, const file_details& details, sections& sections) {
     auto command = temp_seek(s, [&] {
         auto command = read_pod<load_command>(s);
         if (details._needs_byteswap) {
@@ -127,7 +142,7 @@ void read_load_command(freader& s, const file_details& details, dwarf& dwarf) {
 
     switch (command.cmd) {
         case LC_SEGMENT_64:
-            read_lc_segment_64(s, details, dwarf);
+            read_lc_segment_64(s, details, sections);
             break;
         default:
             s.seekg(command.cmdsize, std::ios::cur);
@@ -197,8 +212,14 @@ dwarf dwarf_from_macho(std::uint32_t ofd_index,
     // is found? A problem for later...
     dwarf dwarf(ofd_index, copy(s), copy(details), std::move(callback));
 
+    std::vector<section> sections;
+
     for (std::size_t i = 0; i < load_command_sz; ++i) {
-        read_load_command(s, details, dwarf);
+        read_load_command(s, details, sections);
+    }
+
+    for (const auto& section : sections) {
+        dwarf.register_section(section._name, section._offset, section._size);
     }
 
     return dwarf;
@@ -215,6 +236,8 @@ void read_macho(object_ancestry&& ancestry,
                 std::istream::pos_type end_pos,
                 file_details details,
                 callbacks callbacks) {
+    auto new_s = s.subbuf(end_pos);
+
     callbacks._do_work([_ancestry = std::move(ancestry), _s = std::move(s),
                         _details = std::move(details),
                         _callback = std::move(callbacks._register_die)]() mutable {
